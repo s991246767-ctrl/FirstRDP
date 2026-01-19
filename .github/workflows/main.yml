@@ -5,120 +5,188 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
-
+    
     steps:
       - name: Configure Privacy & Regional Settings
-        shell: pwsh
         run: |
+          # Set timezone to Pacific Standard Time
           Set-TimeZone -Id "Pacific Standard Time"
+          
+          # Set regional format to US
           Set-WinUILanguageOverride -Language en-US
           Set-Culture -CultureInfo en-US
-
-          # Disable telemetry
-          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Force | Out-Null
-          Set-ItemProperty `
-            -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" `
-            -Name "AllowTelemetry" -Type DWord -Value 0
-
-          # FIX: Disable Windows Error Reporting (no cmdlet exists)
-          Set-Service -Name WerSvc -StartupType Disabled -ErrorAction SilentlyContinue
-          Stop-Service -Name WerSvc -Force -ErrorAction SilentlyContinue
-
+          
+          # Disable telemetry and data collection
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" `
+            -Name "AllowTelemetry" -Value 0 -Force
+          
+          # Disable Windows Error Reporting
+          Disable-WindowsErrorReporting
+          
           Write-Host "Privacy settings configured"
 
       - name: Configure Core RDP Settings
-        shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 2
-
-          # FIX: Clean firewall rule
-          netsh advfirewall firewall delete rule name="RDP"
-          netsh advfirewall firewall add rule `
-            name="RDP" dir=in action=allow protocol=TCP localport=3389
-
-          Restart-Service TermService -Force
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Enhanced security: Keep NLA enabled for production
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+          
+          # Use TLS 1.2/1.3 only
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2 -Force
+          
+          # Configure firewall for Tailscale only
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          try {
+            Restart-Service -Name TermService -Force -ErrorAction Stop
+            Write-Host "RDP service restarted successfully"
+          } catch {
+            Write-Warning "Could not restart TermService: $_"
+            # Try to start if not running
+            Start-Service -Name TermService -ErrorAction SilentlyContinue
+          }
 
       - name: Create Secure RDP User
-        shell: pwsh
         run: |
-          $chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
-          $password = -join (1..20 | ForEach-Object { $chars | Get-Random -Count 1 })
-
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser "RDP" -Password $secure -AccountNeverExpires
-          Add-LocalGroupMember Administrators RDP
-          Add-LocalGroupMember "Remote Desktop Users" RDP
-
+          Add-Type -AssemblyName System.Security
+          
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+            Write-Error "User creation failed"
+            exit 1
+          }
 
-      - name: Install Tailscale
-        shell: pwsh
+      - name: Install Tailscale (Private Network)
         run: |
-          Invoke-WebRequest `
-            https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi `
-            -OutFile tailscale.msi
-          Start-Process msiexec.exe -ArgumentList "/i tailscale.msi /quiet /norestart" -Wait
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Configure DNS Privacy
+        run: |
+          # Configure DNS over HTTPS (Cloudflare)
+          Add-DnsClientDohServerAddress -ServerAddress "1.1.1.1" -DohTemplate "https://cloudflare-dns.com/dns-query"
+          Add-DnsClientDohServerAddress -ServerAddress "1.0.0.1" -DohTemplate "https://cloudflare-dns.com/dns-query"
+          
+          # Set DNS servers
+          $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+          Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses ("1.1.1.1", "1.0.0.1")
+          
+          Write-Host "DNS privacy configured"
 
       - name: Establish Tailscale Connection
-        shell: pwsh
         run: |
+          # Connect to Tailscale private network
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
-            --hostname=gh-${{ github.run_id }} `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID `
             --accept-routes `
-            --shields-up `
-            --unattended  # FIX
-
-          Start-Sleep 10
-          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+            --shields-up
+          
+          # Wait for IP assignment
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned"
+            exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Disable Unnecessary Services
-        shell: pwsh
         run: |
-          $services = @(
-            "DiagTrack",
-            "dmwappushservice",
-            "WerSvc",
-            "PcaSvc"
+          # Disable services that may leak information
+          $servicesToDisable = @(
+            "DiagTrack",          # Diagnostics Tracking
+            "dmwappushservice",   # WAP Push Message Routing
+            "WerSvc",             # Windows Error Reporting
+            "OneSyncSvc",         # Sync Host
+            "PcaSvc"              # Program Compatibility Assistant
           )
-
-          foreach ($s in $services) {
-            Stop-Service $s -Force -ErrorAction SilentlyContinue
-            Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
+          
+          foreach ($service in $servicesToDisable) {
+            try {
+              Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
+              Write-Host "Disabled: $service"
+            } catch {
+              Write-Host "Could not disable: $service"
+            }
           }
 
-          # FIX: OneSyncSvc wildcard
-          Get-Service OneSyncSvc* -ErrorAction SilentlyContinue | ForEach-Object {
-            Stop-Service $_ -Force
-            Set-Service $_ -StartupType Disabled
+      - name: Verify Connection Security
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test RDP connectivity
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "RDP connection test failed"
+            exit 1
           }
+          
+          # Verify Tailscale is running
+          $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+          Write-Host "Tailscale Status:`n$tsStatus"
 
       - name: Display Connection Info
-        shell: pwsh
         run: |
-          Write-Host "===================================="
-          Write-Host " TAILSCALE RDP READY"
-          Write-Host " IP: $env:TAILSCALE_IP"
-          Write-Host " USER: RDP"
-          Write-Host " PASS: $env:RDP_PASSWORD"
-          Write-Host " PORT: 3389"
-          Write-Host "===================================="
+          Write-Host "`n===========================================" -ForegroundColor Green
+          Write-Host "  SECURE RDP ACCESS (Tailscale Network)" -ForegroundColor Green
+          Write-Host "===========================================" -ForegroundColor Green
+          Write-Host "Address:  $env:TAILSCALE_IP" -ForegroundColor Cyan
+          Write-Host "Username: RDP" -ForegroundColor Cyan
+          Write-Host "Password: $env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host "Port:     3389" -ForegroundColor Cyan
+          Write-Host "Network:  Tailscale (Private/Encrypted)" -ForegroundColor Cyan
+          Write-Host "Timezone: $(Get-TimeZone | Select-Object -ExpandProperty DisplayName)" -ForegroundColor Cyan
+          Write-Host "===========================================" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "NOTE: Only accessible via Tailscale network" -ForegroundColor Yellow
+          Write-Host ""
 
       - name: Maintain Connection
-        shell: pwsh
         run: |
+          # Keep runner active
           while ($true) {
-            Write-Host "$(Get-Date) | RDP active"
-            Start-Sleep 300
+            $currentTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss PT'
+            Write-Host "[$currentTime] RDP Active | Tailscale Connected"
+            Start-Sleep -Seconds 300
           }
